@@ -9,7 +9,7 @@ This repository contains the Rust implementation components for exploring fully 
 1. A decoupled high-level client-server encrypted arithmetic pipeline (`FheInt128`).
 2. A low-level hardware-oriented LWE modulo $2^{64}$ homomorphic addition benchmark (~200ns execution latency).
 3. A floating-point LWE addition primitive with fixed-point decimal scaling.
-4. An educational LWE diagnostic inspector verifying Torus noise bounds, ideal nearest-level rounding, and residual drift.
+4. Educational LWE diagnostic inspectors verifying Torus noise bounds, ideal nearest-level rounding, and residual drift.
 
 The repository supports our Capstone Project: **"Neuromorphic Acceleration of Secure Encrypted Neural Network Inference"** (Phase-1, Review 2).
 
@@ -27,23 +27,25 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 ├── README.md
 │
 └── src/
-    ├── main.rs                   # Client frontend entry point
+    ├── main.rs                          # Client frontend entry point
     │
     └── bin/
-        ├── backend.rs            # Decoupled TCP server (FheInt128 pipeline)
-        ├── lwe_addition.rs       # Low-level LWE integer addition (~200ns)
-        ├── lwe_addition_float.rs # Low-level LWE floating-point addition
-        └── lwe_inspector.rs      # Low-level LWE noise & ideal rounding demo
+        ├── backend.rs                   # Decoupled TCP server (FheInt128 pipeline)
+        ├── lwe_addition.rs              # Low-level LWE integer addition (~200ns)
+        ├── lwe_addition_float.rs        # Low-level LWE floating-point addition
+        ├── lwe_inspector.rs             # LWE real input with ideal rounding
+        └── lwe_inspector_no_rounding.rs # LWE real input without rounding (noise demo)
 ```
 
 ### File Descriptions
 
 * **`Cargo.toml`** — Package configuration and TFHE-RS dependency (`tfhe = { version = "=1.8.1", features = ["integer"] }`).
 * **`src/main.rs`** — Client frontend that collects user inputs and sends requests to the backend server.
-* **`src/bin/backend.rs`** — TCP backend server listening on `127.0.0.1:7878`. Generates 128-bit IND-CPA keys, installs evaluation keys, evaluates operations on `FheInt128` ciphertexts, and returns decrypted results. *(Replicates Review 2 Slide 13).*
-* **`src/bin/lwe_addition.rs`** — Low-level LWE modulo $2^{64}$ homomorphic addition benchmark. Computes vector additions directly on ciphertexts in 100ns–204ns without decryption. *(Replicates Review 2 Slide 14).*
+* **`src/bin/backend.rs`** — TCP backend server listening on `127.0.0.1:7878`. Generates 128-bit IND-CPA keys, installs evaluation keys, evaluates operations on `FheInt128` ciphertexts, and returns decrypted results.
+* **`src/bin/lwe_addition.rs`** — Low-level LWE modulo $2^{64}$ homomorphic addition benchmark. Computes vector additions directly on ciphertexts in 100ns–204ns without decryption.
 * **`src/bin/lwe_addition_float.rs`** — Low-level LWE floating-point addition. Performs homomorphic addition on continuous decimal inputs (5 decimal places) and absorbs cryptographic noise via nearest-level shift.
-* **`src/bin/lwe_inspector.rs`** — Real-valued LWE noise inspector. Maps decimals to Torus $\mathbb{T}^{64}$, verifies LWE residual noise $e = b - \langle a,s \rangle - m$, demonstrates ideal nearest-level rounding, and shows raw unrounded noise drift ($0.000000000007$).
+* **`src/bin/lwe_inspector.rs`** — Real-valued LWE noise inspector with ideal nearest-level rounding. Maps decimals to Torus $\mathbb{T}^{64}$, verifies LWE residual noise $e = b - \langle a,s \rangle - m$, and recovers the exact input with zero noise corruption.
+* **`src/bin/lwe_inspector_no_rounding.rs`** — Real-valued LWE noise inspector without rounding. Demonstrates raw cryptographic noise residual drift directly on decoded decimals.
 
 ---
 
@@ -57,9 +59,9 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 
 ---
 
-## Review 2 Demo Guide & Execution Instructions
+## Execution Instructions & Demonstration Guide
 
-### 1. Slide 13: Client-Server TFHE Execution (127.0.0.1:7878)
+### 1. High-Level Client-Server TFHE Execution (127.0.0.1:7878)
 In Terminal 1, start the backend server:
 ```bash
 cargo run --bin backend --release
@@ -73,17 +75,17 @@ cargo run --release
 
 ---
 
-### 2. Slide 14: Low-Level LWE Modulo Vector Benchmark (~200ns)
+### 2. Low-Level LWE Modulo Vector Benchmark (~200ns)
 Run the hardware modulo addition benchmark:
 ```bash
 cargo run --bin lwe_addition --release
 ```
 * **Inputs:** Enter `4` and `3`.
-* **Output:** Executes modulo $2^{64}$ vector addition in 100ns–300ns, absorbs noise, and outputs `7`. Replicates Slide 14 character-for-character.
+* **Output:** Executes modulo $2^{64}$ vector addition in 100ns–300ns, absorbs noise, and outputs `7`.
 
 ---
 
-### 3. Bonus Demo: Low-Level Decimal Addition
+### 3. Low-Level Decimal Addition
 Demonstrates low-level LWE addition directly on continuous decimal numbers:
 ```bash
 cargo run --bin lwe_addition_float --release
@@ -93,7 +95,7 @@ cargo run --bin lwe_addition_float --release
 
 ---
 
-### 4. Bonus Demo: Decimal Noise Bounds & Ideal Rounding
+### 4. Decimal Noise Bounds & Ideal Rounding
 Demonstrates cryptographic noise residual ($e$) and ideal rounding:
 ```bash
 cargo run --bin lwe_inspector --release
@@ -101,6 +103,16 @@ cargo run --bin lwe_inspector --release
 * **Input:** Enter e.g. `3.14`.
 * **Section [8]:** Shows ideal rounding recovering exact input `3.14000`.
 * **Section [9]:** Shows raw unrounded reading with noise drift ($0.000000000007$).
+
+---
+
+### 5. Raw Noise Diagnostic (Without Rounding)
+Demonstrates continuous unrounded noise drift on real-valued inputs:
+```bash
+cargo run --bin lwe_inspector_no_rounding --release
+```
+* **Input:** Enter e.g. `3.14`.
+* **Output:** Displays raw Torus decoding and observed residual noise difference.
 
 ---
 
