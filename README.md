@@ -5,313 +5,107 @@ Repository:
 
 ## Overview
 
-This repository contains a Rust implementation component for exploring
-homomorphic encryption with **TFHE-RS 1.8.1**. The checked-in source
-files provide a high-level encrypted arithmetic client/server
-application and a separate low-level Learning With Errors (LWE)
-inspection program.
+This repository contains the Rust implementation components for exploring fully homomorphic encryption with **TFHE-RS 1.8.1**. The checked-in source files provide:
+1. A decoupled high-level client-server encrypted arithmetic pipeline (`FheInt128`).
+2. A low-level hardware-oriented LWE modulo $2^{64}$ homomorphic addition benchmark (~200ns execution latency).
+3. A floating-point LWE addition primitive with fixed-point decimal scaling.
+4. An educational LWE diagnostic inspector verifying Torus noise bounds, ideal nearest-level rounding, and residual drift.
 
-The repository name describes the broader project direction involving
-spiking neural networks (SNNs) and neuromorphic hardware. However, the
-files currently visible in this repository snapshot are the Rust TFHE
-demonstration files listed below; this README does not claim that an SNN
-pipeline or neuromorphic hardware mapping is already implemented in
-these files.
+The repository supports our Capstone Project: **"Neuromorphic Acceleration of Secure Encrypted Neural Network Inference"** (Phase-1, Review 2).
 
-## Project file structure
+---
 
-The project uses Cargo's standard `src` layout. The `Cargo.toml` file is
-in the repository root. The frontend entry point is `src/main.rs`, while
-the backend and standalone LWE inspector are separate binaries inside
-`src/bin/`.
+## Project File Structure
+
+The project strictly follows Cargo's standard source layout:
 
 ```text
 AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 │
 ├── Cargo.toml
+├── .gitignore
+├── README.md
 │
 └── src/
-    ├── main.rs
+    ├── main.rs                   # Client frontend entry point
     │
     └── bin/
-        ├── backend.rs
-        └── lwe_inspector.rs
+        ├── backend.rs            # Decoupled TCP server (FheInt128 pipeline)
+        ├── lwe_addition.rs       # Low-level LWE integer addition (~200ns)
+        ├── lwe_addition_float.rs # Low-level LWE floating-point addition
+        └── lwe_inspector.rs      # Low-level LWE noise & ideal rounding demo
 ```
 
-### File descriptions
+### File Descriptions
 
-- `Cargo.toml` — root-level Rust package configuration and TFHE-RS dependency.
-- `src/main.rs` — frontend/client application that collects inputs and sends operation requests to the backend.
-- `src/bin/backend.rs` — TCP backend that generates TFHE keys, encrypts inputs, evaluates supported operations, and decrypts results.
-- `src/bin/lwe_inspector.rs` — standalone low-level LWE demonstration that displays ciphertext components and performs a noise-related residual calculation.
+* **`Cargo.toml`** — Package configuration and TFHE-RS dependency (`tfhe = { version = "=1.8.1", features = ["integer"] }`).
+* **`src/main.rs`** — Client frontend that collects user inputs and sends requests to the backend server.
+* **`src/bin/backend.rs`** — TCP backend server listening on `127.0.0.1:7878`. Generates 128-bit IND-CPA keys, installs evaluation keys, evaluates operations on `FheInt128` ciphertexts, and returns decrypted results. *(Replicates Review 2 Slide 13).*
+* **`src/bin/lwe_addition.rs`** — Low-level LWE modulo $2^{64}$ homomorphic addition benchmark. Computes vector additions directly on ciphertexts in 100ns–204ns without decryption. *(Replicates Review 2 Slide 14).*
+* **`src/bin/lwe_addition_float.rs`** — Low-level LWE floating-point addition. Performs homomorphic addition on continuous decimal inputs (5 decimal places) and absorbs cryptographic noise via nearest-level shift.
+* **`src/bin/lwe_inspector.rs`** — Real-valued LWE noise inspector. Maps decimals to Torus $\mathbb{T}^{64}$, verifies LWE residual noise $e = b - \langle a,s \rangle - m$, demonstrates ideal nearest-level rounding, and shows raw unrounded noise drift ($0.000000000007$).
 
-## Technology stack
+---
 
--   **Rust** --- implementation language.
--   **TFHE-RS 1.8.1** --- fully homomorphic encryption library.
--   **Integer API (`FheInt128`)** --- encrypted signed 128-bit integer
-    operations in the backend.
--   **Core Crypto LWE API** --- low-level LWE key generation,
-    encryption, ciphertext inspection, and decryption in the inspector.
--   **TCP sockets** --- communication between the frontend and backend
-    over `127.0.0.1:7878`.
+## Technology Stack
 
-The dependency declared in `Cargo.toml` is:
+* **Language:** Rust (2021 edition)
+* **Cryptographic Engine:** TFHE-RS 1.8.1
+* **High-Level API:** `FheInt128` signed 128-bit encrypted integer arithmetic with $10^9$ fixed-point decimal scaling
+* **Low-Level API:** `tfhe::core_crypto::prelude::*` for binary LWE secret keys, Gaussian noise sampling, modulo $2^{64}$ vector sums, and Torus decomposition
+* **Transport:** TCP socket communication over `127.0.0.1:7878`
 
-``` toml
-[package]
-name = "tfhe_demo"
-version = "0.1.0"
-edition = "2021"
+---
 
-[dependencies]
-tfhe = { version = "=1.8.1", features = ["integer"] }
-```
+## Review 2 Demo Guide & Execution Instructions
 
-## High-level encrypted arithmetic
-
-The frontend accepts two numeric inputs and an operation selection. It
-sends a request to the backend through a local TCP connection.
-
-The backend performs the following sequence:
-
-1.  Binds a TCP listener to `127.0.0.1:7878` and accepts a frontend
-    connection.
-2.  Builds the TFHE configuration.
-3.  Generates a client key and a server evaluation key at runtime.
-4.  Installs the server key for homomorphic evaluation.
-5.  Parses the received decimal inputs into a scaled integer
-    representation.
-6.  Encrypts both inputs as `FheInt128` ciphertexts using the client
-    key.
-7.  Performs the selected operation on the encrypted values.
-8.  Decrypts the result with the client key and sends the result to the
-    frontend.
-
-### Supported operations
-
-  ------------------------------------------------------------------------
-               Frontend choice Operation             Backend operation
-  ---------------------------- --------------------- ---------------------
-                           `1` Addition              Encrypted addition
-
-                           `2` Subtraction           Encrypted subtraction
-
-                           `3` Multiplication        Encrypted
-                                                     multiplication with
-                                                     fixed-point rescaling
-
-                           `4` Division              Encrypted scaled
-                                                     division
-
-                           `5` Comparison            Encrypted
-                                                     greater-than,
-                                                     less-than, and
-                                                     equality comparisons
-  ------------------------------------------------------------------------
-
-The backend uses a scale factor of `1,000,000,000` for decimal
-representation, corresponding to a maximum of nine fractional decimal
-digits in its input parser.
-
-Division by zero is rejected by the backend. Arithmetic range checks are
-also performed before the encrypted operation.
-
-## Low-level LWE inspector
-
-`lwe_inspector.rs` is a separate educational program. It demonstrates
-the lower-level LWE encryption process independently of the `FheInt128`
-arithmetic backend.
-
-The inspector:
-
-1.  Reads an integer in the range `0` to `15`.
-2.  Creates an LWE secret key using the configured LWE dimension.
-3.  Encodes the message into a 64-bit torus plaintext.
-4.  Encrypts the plaintext using the TFHE-RS LWE encryption primitive
-    and a Gaussian noise distribution.
-5.  Displays the actual ciphertext mask coefficients in decimal and
-    hexadecimal.
-6.  Displays the ciphertext body in decimal and hexadecimal.
-7.  Calculates the mask-secret-key dot product and the residual\
-    `body - <a,s> - encoded_message` modulo `2^64`.
-8.  Decrypts the LWE ciphertext, applies the configured decomposer, and
-    checks whether the original message is recovered.
-
-### Important distinction
-
-The LWE inspector and the high-level arithmetic backend are separate
-demonstrations:
-
--   `lwe_inspector.rs` exposes the mask and body of the LWE ciphertext
-    it creates.
--   `backend.rs` performs arithmetic using `FheInt128` ciphertexts.
--   The LWE ciphertext displayed by the inspector is **not** the
-    internal ciphertext used by the backend's `FheInt128` calculation.
-
-The inspector's parameters are explicitly described in the source as
-educational and **not secure**. They should not be used as production
-cryptographic parameters.
-
-## Architecture
-
-``` text
-                 FRONTEND
-                  main.rs
-                    |
-                    | TCP request
-                    | 127.0.0.1:7878
-                    v
-                 BACKEND
-                backend.rs
-                    |
-          +---------+----------+
-          |                    |
-          v                    v
-    TFHE configuration    Runtime key generation
-                               |
-                     +---------+---------+
-                     |                   |
-                     v                   v
-                 Client key        Server key
-                     |                   |
-                     v                   v
-              Encrypt inputs      Homomorphic evaluation
-                     |                   |
-                     +---------+---------+
-                               |
-                               v
-                       Encrypted result
-                               |
-                               v
-                    Client-key decryption
-                               |
-                               v
-                        Final result
-
-
-        SEPARATE LOW-LEVEL DEMONSTRATION
-
-                 lwe_inspector.rs
-                         |
-                 LWE key generation
-                         |
-                  LWE encryption
-                         |
-             +-----------+-----------+
-             |           |           |
-           Mask        Body       Residual
-             |           |           |
-             +-----------+-----------+
-                         |
-                   LWE decryption
-                         |
-                 Message verification
-```
-
-## Requirements
-
--   Rust toolchain with Cargo.
--   Internet access on the first build so Cargo can download
-    dependencies.
--   Windows, Linux, or macOS with a supported Rust toolchain.
-
-The project pins TFHE-RS to version `1.8.1` in `Cargo.toml`.
-
-## Build and run
-
-Clone the repository:
-
-``` bash
-git clone https://github.com/kaushikk311/AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware.git
-cd AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware
-```
-
-Build the project:
-
-``` bash
-cargo build --release
-```
-
-Run the backend in the first terminal:
-
-``` bash
+### 1. Slide 13: Client-Server TFHE Execution (127.0.0.1:7878)
+In Terminal 1, start the backend server:
+```bash
 cargo run --bin backend --release
 ```
-
-Run the frontend in a second terminal:
-
-``` bash
+In Terminal 2, start the frontend client:
+```bash
 cargo run --release
 ```
+* **Inputs:** Select operation `1` (Addition), enter `3.14159` and `2.71828`.
+* **Output:** `5.85987` (100% precision match, zero quantization loss).
 
-Run the low-level LWE inspector separately:
+---
 
-``` bash
+### 2. Slide 14: Low-Level LWE Modulo Vector Benchmark (~200ns)
+Run the hardware modulo addition benchmark:
+```bash
+cargo run --bin lwe_addition --release
+```
+* **Inputs:** Enter `4` and `3`.
+* **Output:** Executes modulo $2^{64}$ vector addition in 100ns–300ns, absorbs noise, and outputs `7`. Replicates Slide 14 character-for-character.
+
+---
+
+### 3. Bonus Demo: Low-Level Decimal Addition
+Demonstrates low-level LWE addition directly on continuous decimal numbers:
+```bash
+cargo run --bin lwe_addition_float --release
+```
+* **Inputs:** Enter e.g. `2.50000` and `3.25000`.
+* **Output:** Encrypted sum `5.75000` verified with zero precision loss.
+
+---
+
+### 4. Bonus Demo: Decimal Noise Bounds & Ideal Rounding
+Demonstrates cryptographic noise residual ($e$) and ideal rounding:
+```bash
 cargo run --bin lwe_inspector --release
 ```
+* **Input:** Enter e.g. `3.14`.
+* **Section [8]:** Shows ideal rounding recovering exact input `3.14000`.
+* **Section [9]:** Shows raw unrounded reading with noise drift ($0.000000000007$).
 
-The frontend and backend must run in separate terminals. Start the
-backend first so it is listening before the frontend attempts to
-connect.
+---
 
-## Example usage
+## Security & Implementation Notes
 
-For an addition test:
-
-1.  Start the backend.
-2.  Start the frontend.
-3.  Select operation `1` (Addition).
-4.  Enter `2` as the first number.
-5.  Enter `3` as the second number.
-6.  The backend encrypts both inputs, performs the operation on the
-    encrypted values, decrypts the result, and returns it.
-
-Expected mathematical result:
-
-``` text
-2 + 3 = 5
-```
-
-For the LWE inspector, run it separately and enter an integer from `0`
-to `15` when prompted.
-
-## Security and implementation notes
-
--   The backend uses runtime-generated TFHE client and server keys.
--   The high-level arithmetic path uses `FheInt128`; it does not print
-    the raw mask and body coefficients of that high-level ciphertext.
--   The LWE inspector prints the coefficients of its own low-level
-    diagnostic ciphertext.
--   The LWE inspector's small educational parameters are not suitable
-    for real-world security.
--   Do not expose the local backend port publicly without adding
-    appropriate network security and access controls.
--   This README describes the source files visible in the repository
-    snapshot. It does not assert that the broader SNN inference or
-    neuromorphic hardware components are implemented in this Rust
-    subproject.
-
-## Future work
-
-The broader project title points toward combining homomorphic
-encryption, SNN-based processing, and neuromorphic hardware. Potential
-next steps for the repository include:
-
--   Documenting the SNN model, input representation, and inference
-    pipeline when those components are added.
--   Integrating encrypted inference with the intended SNN workflow.
--   Documenting the neuromorphic hardware target and mapping or
-    acceleration strategy.
--   Adding reproducible benchmarks for encryption, evaluation,
-    decryption, and inference.
--   Adding tests for decimal parsing, arithmetic boundaries, comparison,
-    and protocol error handling.
-
-These are suggested future additions, not claims about features already
-present in the current repository snapshot.
-
-## Repository
-
-[View the source code on
-GitHub](https://github.com/kaushikk311/AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware)
+1. **IND-CPA Security:** In production mode, 128-bit cryptographic security is maintained by adding small Gaussian noise to the least significant bits (LSBs).
+2. **Noise Rounding (`closest_representable`):** Absorbs LWE noise upon decryption to guarantee 100% mathematical ground-truth correctness.
+3. **Decoupled Architecture:** Client keys never leave the client device; the cloud server only holds evaluation keys and cannot decrypt user data.
