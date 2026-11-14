@@ -53,6 +53,7 @@ fn main() {
         println!();
         println!("Enter a complete expression (or type exit):");
         println!("Example: 1.25 + (-2.5 * 3)");
+        println!("Division and comparison: 5 / 2 >= 2.5");
         print!("expression> ");
         io::stdout().flush().expect("flush prompt");
         let mut expr = String::new();
