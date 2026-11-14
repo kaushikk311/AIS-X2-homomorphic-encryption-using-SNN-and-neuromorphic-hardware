@@ -10,7 +10,7 @@ use tfhe_demo::ADDRESS;
 
 #[path = "backend/radix.rs"]
 mod radix;
-use radix::{EncryptedValue, Radix};
+use radix::{Digit, EncryptedValue, Radix};
 
 fn send(stream: &mut TcpStream, line: &str) -> io::Result<()> {
     println!("{line}");
@@ -26,10 +26,11 @@ fn validate(expr: &Expr) -> Result<(), String> {
         )),
         Expr::Unary { op: '+' | '-', rhs } => validate(rhs),
         Expr::Binary {
-            op: '+' | '-' | '*',
+            op: '+' | '-' | '*' | '/',
             lhs,
             rhs,
-        } => {
+        }
+        | Expr::Compare { lhs, rhs, .. } => {
             validate(lhs)?;
             validate(rhs)
         }
@@ -44,31 +45,58 @@ fn evaluate(
     radix: &Radix,
     key: &LweSecretKeyOwned<u64>,
     generator: &mut EncryptionRandomGenerator<DefaultRandomGenerator>,
-) -> EncryptedValue {
+) -> (EncryptedValue, Option<Digit>) {
     match expr {
-        Expr::Number(value) => radix.encrypt(*value, key, generator),
+        Expr::Number(value) => (radix.encrypt(*value, key, generator), None),
         Expr::Unary { op, rhs } => {
-            let value = evaluate(rhs, radix, key, generator);
-            if *op == '-' {
+            let (value, error) = evaluate(rhs, radix, key, generator);
+            let value = if *op == '-' {
                 radix.negate(&value)
             } else {
                 value
-            }
+            };
+            (value, error)
         }
         Expr::Binary { op, lhs, rhs } => {
-            let left = evaluate(lhs, radix, key, generator);
-            let right = evaluate(rhs, radix, key, generator);
+            let (left, lhs_error) = evaluate(lhs, radix, key, generator);
+            let (right, rhs_error) = evaluate(rhs, radix, key, generator);
             let start = Instant::now();
-            let value = match op {
-                '+' => radix.add(&left, &right, false),
-                '-' => radix.add(&left, &right, true),
-                '*' => radix.multiply(&left, &right),
+            let (value, operation_error) = match op {
+                '+' => (radix.add(&left, &right, false), None),
+                '-' => (radix.add(&left, &right, true), None),
+                '*' => (radix.multiply(&left, &right), None),
+                '/' => {
+                    let (value, zero) = radix.divide(&left, &right);
+                    (value, Some(zero))
+                }
                 _ => unreachable!("operator validated before evaluation"),
             };
             println!("[EVAL/PBS/KS] {op} in {:?}", start.elapsed());
-            value
+            (
+                value,
+                merge_errors(
+                    radix,
+                    merge_errors(radix, lhs_error, rhs_error),
+                    operation_error,
+                ),
+            )
+        }
+        Expr::Compare { op, lhs, rhs } => {
+            let (left, lhs_error) = evaluate(lhs, radix, key, generator);
+            let (right, rhs_error) = evaluate(rhs, radix, key, generator);
+            let start = Instant::now();
+            let value = radix.compare(&left, &right, *op);
+            println!("[COMPARE/PBS/KS] {op:?} in {:?}", start.elapsed());
+            (value, merge_errors(radix, lhs_error, rhs_error))
         }
         Expr::Variable(_) => unreachable!("variables rejected before evaluation"),
+    }
+}
+
+fn merge_errors(radix: &Radix, left: Option<Digit>, right: Option<Digit>) -> Option<Digit> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(radix.either_error(left, &right)),
+        (left, right) => left.or(right),
     }
 }
 
@@ -192,7 +220,20 @@ fn main() -> io::Result<()> {
         };
 
         send(&mut stream, "STATUS|Evaluating encrypted expression")?;
-        let result = evaluate(&expr, &radix, &small_key, &mut encryption_generator);
+        let (result, error) = evaluate(&expr, &radix, &small_key, &mut encryption_generator);
+        if let Some(flag) = error {
+            match radix.decrypt_error(&flag, &small_key) {
+                Ok(false) => {}
+                Ok(true) => {
+                    send(&mut stream, "ERROR|Division by zero")?;
+                    continue;
+                }
+                Err(error) => {
+                    send(&mut stream, &format!("ERROR|{error}"))?;
+                    continue;
+                }
+            }
+        }
         inspect_radix(&result);
         let start = Instant::now();
         match radix.decrypt(&result, &small_key) {
