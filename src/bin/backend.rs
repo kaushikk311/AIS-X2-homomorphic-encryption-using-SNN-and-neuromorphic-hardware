@@ -1,436 +1,206 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
-use tfhe::prelude::*;
-use tfhe::{generate_keys, set_server_key, ConfigBuilder, FheInt128};
+use tfhe::core_crypto::prelude::*;
+use tfhe::shortint::parameters::v1_8::V1_8_PARAM_MESSAGE_2_CARRY_2_KS_PBS_GAUSSIAN_2M128;
 
-const SCALE: i128 = 1_000_000_000;
-const PORT: &str = "127.0.0.1:7878";
+use tfhe_demo::expression::{format_fixed, parse, Expr, SCALE};
+use tfhe_demo::ADDRESS;
 
-fn send(stream: &mut TcpStream, message: &str) {
-    println!("[BACKEND] {message}");
+#[path = "backend/radix.rs"]
+mod radix;
+use radix::{EncryptedValue, Radix};
 
-    writeln!(stream, "{message}")
-        .expect("Could not send message to frontend");
-
+fn send(stream: &mut TcpStream, line: &str) -> io::Result<()> {
+    println!("{line}");
+    writeln!(stream, "{line}")?;
     stream.flush()
-        .expect("Could not flush TCP stream");
 }
 
-// Convert decimal input into a scaled i128 integer.
-// Supports up to 9 decimal places.
-fn parse_decimal(input: &str) -> Result<i128, String> {
-    let input = input.trim();
-
-    let (negative, unsigned) = if let Some(rest) = input.strip_prefix('-') {
-        (true, rest)
-    } else if let Some(rest) = input.strip_prefix('+') {
-        (false, rest)
-    } else {
-        (false, input)
-    };
-
-    if unsigned.is_empty() {
-        return Err("Input cannot be empty".into());
+fn validate(expr: &Expr) -> Result<(), String> {
+    match expr {
+        Expr::Number(_) => Ok(()),
+        Expr::Variable(name) => Err(format!(
+            "Variable '{name}' requires an encrypted assignment"
+        )),
+        Expr::Unary { op: '+' | '-', rhs } => validate(rhs),
+        Expr::Binary {
+            op: '+' | '-' | '*',
+            lhs,
+            rhs,
+        } => {
+            validate(lhs)?;
+            validate(rhs)
+        }
+        Expr::Unary { op, .. } | Expr::Binary { op, .. } => {
+            Err(format!("Unsupported encrypted operator: {op}"))
+        }
     }
+}
 
-    let mut parts = unsigned.split('.');
+fn evaluate(
+    expr: &Expr,
+    radix: &Radix,
+    key: &LweSecretKeyOwned<u64>,
+    generator: &mut EncryptionRandomGenerator<DefaultRandomGenerator>,
+) -> EncryptedValue {
+    match expr {
+        Expr::Number(value) => radix.encrypt(*value, key, generator),
+        Expr::Unary { op, rhs } => {
+            let value = evaluate(rhs, radix, key, generator);
+            if *op == '-' {
+                radix.negate(&value)
+            } else {
+                value
+            }
+        }
+        Expr::Binary { op, lhs, rhs } => {
+            let left = evaluate(lhs, radix, key, generator);
+            let right = evaluate(rhs, radix, key, generator);
+            let start = Instant::now();
+            let value = match op {
+                '+' => radix.add(&left, &right, false),
+                '-' => radix.add(&left, &right, true),
+                '*' => radix.multiply(&left, &right),
+                _ => unreachable!("operator validated before evaluation"),
+            };
+            println!("[EVAL/PBS/KS] {op} in {:?}", start.elapsed());
+            value
+        }
+        Expr::Variable(_) => unreachable!("variables rejected before evaluation"),
+    }
+}
 
-    let whole_text = parts.next().unwrap_or("");
-    let fraction_text = parts.next().unwrap_or("");
-
-    if parts.next().is_some()
-        || (whole_text.is_empty() && fraction_text.is_empty())
-        || !whole_text.chars().all(|c| c.is_ascii_digit())
-        || !fraction_text.chars().all(|c| c.is_ascii_digit())
-        || fraction_text.len() > 9
-    {
-        return Err(
-            "Enter a decimal with at most 9 decimal places".into()
+fn inspect_radix(value: &EncryptedValue) {
+    println!("[RESULT] {} encrypted radix blocks", value.blocks.len());
+    for (index, ciphertext) in value.blocks.iter().enumerate() {
+        let mask = ciphertext.get_mask();
+        let coefficients = mask.as_ref();
+        println!(
+            "[BLOCK {index}] LWE dimension={}, first mask coefficients={:?}, body={}",
+            coefficients.len(),
+            &coefficients[..coefficients.len().min(8)],
+            ciphertext.get_body().data,
         );
     }
-
-    let whole: i128 = if whole_text.is_empty() {
-        0
-    } else {
-        whole_text
-            .parse()
-            .map_err(|_| "Integer part is too large")?
-    };
-
-    let mut fraction = fraction_text.to_string();
-
-    while fraction.len() < 9 {
-        fraction.push('0');
-    }
-
-    let fractional: i128 = fraction
-        .parse()
-        .map_err(|_| "Invalid fractional part")?;
-
-    let value = whole
-        .checked_mul(SCALE)
-        .and_then(|v| v.checked_add(fractional))
-        .ok_or_else(|| "Number exceeds supported range".to_string())?;
-
-    if negative {
-        value
-            .checked_neg()
-            .ok_or_else(|| "Number exceeds supported range".to_string())
-    } else {
-        Ok(value)
-    }
 }
 
-// Convert the scaled integer back into a decimal string.
-fn format_decimal(value: i128) -> String {
-    let magnitude = value.unsigned_abs();
-    let scale = SCALE as u128;
+fn main() -> io::Result<()> {
+    let listener = TcpListener::bind(ADDRESS)?;
+    println!("[BACKEND] Listening on {ADDRESS}");
+    let (mut stream, peer) = listener.accept()?;
+    println!("[BACKEND] Connected: {peer}");
 
-    let whole = magnitude / scale;
-    let fraction = magnitude % scale;
+    let params = V1_8_PARAM_MESSAGE_2_CARRY_2_KS_PBS_GAUSSIAN_2M128;
+    let mut boxed_seeder = new_seeder();
+    let seeder = boxed_seeder.as_mut();
+    let mut secret_generator = SecretRandomGenerator::<DefaultRandomGenerator>::new(seeder.seed());
+    let mut encryption_generator =
+        EncryptionRandomGenerator::<DefaultRandomGenerator>::new(seeder.seed(), seeder);
 
-    let fraction_text = format!("{:09}", fraction);
-    let fraction_text = fraction_text.trim_end_matches('0');
-
-    let sign = if value < 0 { "-" } else { "" };
-
-    if fraction_text.is_empty() {
-        format!("{sign}{whole}")
-    } else {
-        format!("{sign}{whole}.{fraction_text}")
-    }
-}
-
-fn main() {
-    println!("==========================================");
-    println!("         TFHE BACKEND SERVER");
-    println!("==========================================");
-
-    let listener = TcpListener::bind(PORT)
-        .expect("Could not bind to backend port");
-
-    println!("[BACKEND] Listening on {PORT}");
-    println!("[BACKEND] Waiting for frontend connection...");
-
-    let (mut stream, address) = listener
-        .accept()
-        .expect("Could not accept frontend connection");
-
-    println!("[BACKEND] Frontend connected: {address}");
-
-    send(&mut stream, "STATUS|Frontend connected to backend");
-
-    // ==========================================
-    // TFHE CONFIGURATION AND KEY GENERATION
-    // ==========================================
-
-    println!("\n========== KEY GENERATION ==========");
-
-    send(&mut stream, "STATUS|Preparing TFHE configuration");
-
-    let config = ConfigBuilder::default().build();
-
-    send(&mut stream, "STATUS|Calling TFHE-RS key generation");
+    send(&mut stream, "STATUS|Generating runtime LWE and GLWE keys")?;
+    let start = Instant::now();
+    let small_key = LweSecretKey::generate_new_binary(params.lwe_dimension, &mut secret_generator);
+    let glwe_key = GlweSecretKey::generate_new_binary(
+        params.glwe_dimension,
+        params.polynomial_size,
+        &mut secret_generator,
+    );
+    let large_key = glwe_key.clone().into_lwe_secret_key();
+    println!("[KEYGEN] LWE and GLWE keys: {:?}", start.elapsed());
 
     send(
         &mut stream,
-        "STATUS|Generating client key and server evaluation key",
+        "STATUS|Generating standard and Fourier bootstrapping keys",
+    )?;
+    let start = Instant::now();
+    let standard_bsk = par_allocate_and_generate_new_lwe_bootstrap_key(
+        &small_key,
+        &glwe_key,
+        params.pbs_base_log,
+        params.pbs_level,
+        params.glwe_noise_distribution,
+        params.ciphertext_modulus,
+        &mut encryption_generator,
     );
-
-    println!("[BACKEND] Calling generate_keys(config) now...");
-
-    let key_start = Instant::now();
-
-    // Actual TFHE-RS cryptographic key generation.
-    let (client_key, server_key) = generate_keys(config);
-
-    let key_duration = key_start.elapsed();
-
-    println!("[BACKEND] Key generation call completed.");
-    println!("[BACKEND] Key generation duration: {key_duration:?}");
-
-    send(&mut stream, "STATUS|Client key generated");
-    send(&mut stream, "STATUS|Server evaluation key generated");
-
-    set_server_key(server_key);
-
-    send(&mut stream, "STATUS|Server evaluation key installed");
-    send(&mut stream, "STATUS|Backend ready for encrypted operations");
-    send(&mut stream, "READY");
-
-    println!("\n[BACKEND] Waiting for calculation requests...");
-
-    let mut reader = BufReader::new(
-        stream.try_clone()
-            .expect("Could not clone TCP connection"),
+    println!("[KEYGEN] Standard BSK: {:?}", start.elapsed());
+    let start = Instant::now();
+    let mut fourier_bsk = FourierLweBootstrapKey::new(
+        standard_bsk.input_lwe_dimension(),
+        standard_bsk.glwe_size(),
+        standard_bsk.polynomial_size(),
+        standard_bsk.decomposition_base_log(),
+        standard_bsk.decomposition_level_count(),
     );
+    convert_standard_lwe_bootstrap_key_to_fourier(&standard_bsk, &mut fourier_bsk);
+    println!("[KEYGEN] Fourier conversion: {:?}", start.elapsed());
+    drop(standard_bsk);
 
-    // ==========================================
-    // MAIN REQUEST PROCESSING LOOP
-    // ==========================================
+    send(
+        &mut stream,
+        "STATUS|Generating key-switching key and PBS lookup tables",
+    )?;
+    let start = Instant::now();
+    let ksk = allocate_and_generate_new_lwe_keyswitch_key(
+        &large_key,
+        &small_key,
+        params.ks_base_log,
+        params.ks_level,
+        params.lwe_noise_distribution,
+        params.ciphertext_modulus,
+        &mut encryption_generator,
+    );
+    println!("[KEYGEN] Key switching key: {:?}", start.elapsed());
+    drop(large_key);
+    drop(glwe_key);
+    let radix = Radix::new(
+        params,
+        fourier_bsk,
+        ksk,
+        &small_key,
+        &mut encryption_generator,
+    );
+    println!(
+        "[PARAMETERS] scale={SCALE}, radix={}, LWE dimension={}, polynomial size={}, LWE noise={:?}, GLWE noise={:?}, modulus switch={:?}",
+        radix.base, params.lwe_dimension.0, params.polynomial_size.0,
+        params.lwe_noise_distribution, params.glwe_noise_distribution,
+        params.modulus_switch_noise_reduction_params,
+    );
+    send(&mut stream, "READY")?;
 
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
     loop {
-        let mut request = String::new();
-
-        if reader.read_line(&mut request).unwrap_or(0) == 0 {
-            println!("[BACKEND] Frontend disconnected.");
-            break;
+        line.clear();
+        if reader.read_line(&mut line)? == 0 || line.trim_end() == "EXIT" {
+            return Ok(());
         }
-
-        let request = request.trim();
-
-        if request == "EXIT" {
-            send(&mut stream, "RESULT|Backend session closed");
-            break;
-        }
-
-        let fields: Vec<&str> = request.splitn(3, '|').collect();
-
-        if fields.len() != 3 {
-            send(&mut stream, "ERROR|Invalid request format");
+        let Some(source) = line.trim_end().strip_prefix("EXPR|") else {
+            send(&mut stream, "ERROR|Invalid expression request")?;
             continue;
-        }
-
-        // Protocol: operation is "1", "2", "3", "4", or "5".
-        let operation = fields[0];
-
-        let a = match parse_decimal(fields[1]) {
-            Ok(value) => value,
+        };
+        let expr = match parse(source).and_then(|expr| {
+            validate(&expr)?;
+            Ok(expr)
+        }) {
+            Ok(expr) => expr,
             Err(error) => {
-                send(&mut stream, &format!("ERROR|First input: {error}"));
+                send(&mut stream, &format!("ERROR|{error}"))?;
                 continue;
             }
         };
 
-        let b = match parse_decimal(fields[2]) {
-            Ok(value) => value,
-            Err(error) => {
-                send(&mut stream, &format!("ERROR|Second input: {error}"));
-                continue;
+        send(&mut stream, "STATUS|Evaluating encrypted expression")?;
+        let result = evaluate(&expr, &radix, &small_key, &mut encryption_generator);
+        inspect_radix(&result);
+        let start = Instant::now();
+        match radix.decrypt(&result, &small_key) {
+            Ok(value) => {
+                println!("[DECRYPT] Final radix result: {:?}", start.elapsed());
+                send(&mut stream, &format!("VALUE|{}", format_fixed(value)))?;
             }
-        };
-
-        if !["1", "2", "3", "4", "5"].contains(&operation) {
-            send(&mut stream, "ERROR|Unknown operation");
-            continue;
+            Err(error) => send(&mut stream, &format!("ERROR|{error}"))?,
         }
-
-        if operation == "4" && b == 0 {
-            send(
-                &mut stream,
-                "ERROR|Division by zero is not allowed",
-            );
-            continue;
-        }
-
-        // Validate arithmetic ranges before encryption.
-        let valid = match operation {
-            "1" => a.checked_add(b).is_some(),
-
-            "2" => a.checked_sub(b).is_some(),
-
-            "3" => a.checked_mul(b).is_some(),
-
-            "4" => a.checked_mul(SCALE)
-                .and_then(|n| n.checked_div(b))
-                .is_some(),
-
-            "5" => true,
-
-            _ => false,
-        };
-
-        if !valid {
-            send(
-                &mut stream,
-                "ERROR|Operation exceeds the supported arithmetic range",
-            );
-            continue;
-        }
-
-        send(&mut stream, "STATUS|Received input from frontend");
-
-        // ==========================================
-        // ENCRYPTION OF INPUT 1
-        // ==========================================
-
-        println!("\n========== ENCRYPTION: INPUT 1 ==========");
-
-        send(
-            &mut stream,
-            "STATUS|Starting actual TFHE encryption of input 1",
-        );
-
-        let start_a = Instant::now();
-
-        // Actual encryption using TFHE-RS.
-        let encrypted_a = FheInt128::encrypt(a, &client_key);
-
-        let elapsed_a = start_a.elapsed();
-
-        println!("[BACKEND] TFHE encryption call for input 1 returned.");
-        println!("[BACKEND] Ciphertext type: FheInt128");
-        println!("[BACKEND] Encryption duration: {elapsed_a:?}");
-
-        println!(
-            "[BACKEND] Ciphertext object is retained for encrypted computation."
-        );
-
-        send(&mut stream, "STATUS|Input 1 encryption completed");
-
-        // ==========================================
-        // ENCRYPTION OF INPUT 2
-        // ==========================================
-
-        println!("\n========== ENCRYPTION: INPUT 2 ==========");
-
-        send(
-            &mut stream,
-            "STATUS|Starting actual TFHE encryption of input 2",
-        );
-
-        let start_b = Instant::now();
-
-        // Actual encryption using TFHE-RS.
-        let encrypted_b = FheInt128::encrypt(b, &client_key);
-
-        let elapsed_b = start_b.elapsed();
-
-        println!("[BACKEND] TFHE encryption call for input 2 returned.");
-        println!("[BACKEND] Ciphertext type: FheInt128");
-        println!("[BACKEND] Encryption duration: {elapsed_b:?}");
-
-        println!(
-            "[BACKEND] Ciphertext object is retained for encrypted computation."
-        );
-
-        send(&mut stream, "STATUS|Both inputs encrypted");
-
-        // ==========================================
-        // ENCRYPTED COMPUTATION
-        // ==========================================
-
-        println!("\n========== ENCRYPTED COMPUTATION ==========");
-
-        send(
-            &mut stream,
-            "STATUS|Evaluating operation on ciphertexts",
-        );
-
-        let compute_start = Instant::now();
-
-        // Operations are performed on encrypted values.
-        let encrypted_result = match operation {
-
-            // ADDITION
-            "1" => {
-                &encrypted_a + &encrypted_b
-            }
-
-            // SUBTRACTION
-            "2" => {
-                &encrypted_a - &encrypted_b
-            }
-
-            // MULTIPLICATION
-            "3" => {
-                let product = &encrypted_a * &encrypted_b;
-                &product / SCALE
-            }
-
-            // DIVISION
-            "4" => {
-                let numerator = &encrypted_a * SCALE;
-                &numerator / &encrypted_b
-            }
-
-            // COMPARISON
-            "5" => {
-                let gt = encrypted_a.gt(&encrypted_b);
-                let lt = encrypted_a.lt(&encrypted_b);
-                let eq = encrypted_a.eq(&encrypted_b);
-
-                let compute_time = compute_start.elapsed();
-
-                send(
-                    &mut stream,
-                    "STATUS|Encrypted computation completed",
-                );
-
-                println!(
-                    "[BACKEND] Encrypted comparisons completed in {compute_time:?}"
-                );
-
-                send(
-                    &mut stream,
-                    "STATUS|Decrypting result with client key",
-                );
-
-                let gt: bool = gt.decrypt(&client_key);
-                let lt: bool = lt.decrypt(&client_key);
-                let eq: bool = eq.decrypt(&client_key);
-
-                let result = format!(
-                    "Greater={gt}, Less={lt}, Equal={eq}"
-                );
-
-                send(&mut stream, "RESULT|Operation completed");
-                send(&mut stream, &format!("VALUE|{result}"));
-
-                continue;
-            }
-
-            _ => unreachable!(),
-        };
-
-        let compute_time = compute_start.elapsed();
-
-        println!(
-            "[BACKEND] Encrypted computation duration: {compute_time:?}"
-        );
-
-        send(&mut stream, "STATUS|Encrypted computation completed");
-
-        // ==========================================
-        // DECRYPTION
-        // ==========================================
-
-        println!("\n========== DECRYPTION ==========");
-
-        send(
-            &mut stream,
-            "STATUS|Decrypting result with client key",
-        );
-
-        let decrypt_start = Instant::now();
-
-        // Actual TFHE-RS decryption.
-        let result: i128 = encrypted_result.decrypt(&client_key);
-
-        let decrypt_time = decrypt_start.elapsed();
-
-        println!("[BACKEND] Decryption completed.");
-        println!("[BACKEND] Decryption duration: {decrypt_time:?}");
-
-        let formatted_result = format_decimal(result);
-
-        send(&mut stream, "RESULT|Operation completed");
-        send(&mut stream, &format!("VALUE|{formatted_result}"));
-
-        // ==========================================
-        // OPERATION SUMMARY
-        // ==========================================
-
-        println!("\n========== OPERATION SUMMARY ==========");
-
-        println!("Input 1 encryption time: {elapsed_a:?}");
-        println!("Input 2 encryption time: {elapsed_b:?}");
-        println!("Encrypted computation time: {compute_time:?}");
-        println!("Decryption time: {decrypt_time:?}");
-        println!("Decrypted result: {formatted_result}");
-
-        println!("=======================================");
     }
 }
