@@ -1,5 +1,6 @@
 
 use std::collections::HashMap;
+use std::cmp::Ordering;
 
 const FRACTION_DIGITS: usize = 5;
 pub const SCALE: i128 = 10i128.pow(FRACTION_DIGITS as u32);
@@ -11,6 +12,30 @@ pub enum Expr {
     Variable(String),
     Unary { op: char, rhs: Box<Expr> },
     Binary { op: char, lhs: Box<Expr>, rhs: Box<Expr> },
+    Compare { op: Comparison, lhs: Box<Expr>, rhs: Box<Expr> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    Less,
+    LessEqual,
+    Equal,
+    NotEqual,
+    GreaterEqual,
+    Greater,
+}
+
+impl Comparison {
+    pub fn matches(self, order: Ordering) -> bool {
+        match self {
+            Self::Less => order.is_lt(),
+            Self::LessEqual => !order.is_gt(),
+            Self::Equal => order.is_eq(),
+            Self::NotEqual => !order.is_eq(),
+            Self::GreaterEqual => !order.is_lt(),
+            Self::Greater => order.is_gt(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +43,7 @@ enum Token {
     Number(i128),
     Ident(String),
     Op(char),
+    Compare(Comparison),
     LParen,
     RParen,
 }
@@ -89,6 +115,21 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
             out.push(Token::Ident(chars[start..i].iter().collect()));
             continue;
         }
+        let followed_by_equals = chars.get(i + 1) == Some(&'=');
+        let comparison = match (c, followed_by_equals) {
+            ('<', false) => Some(Comparison::Less),
+            ('<', true) => Some(Comparison::LessEqual),
+            ('=', true) => Some(Comparison::Equal),
+            ('!', true) => Some(Comparison::NotEqual),
+            ('>', true) => Some(Comparison::GreaterEqual),
+            ('>', false) => Some(Comparison::Greater),
+            _ => None,
+        };
+        if let Some(op) = comparison {
+            out.push(Token::Compare(op));
+            i += 1 + usize::from(followed_by_equals);
+            continue;
+        }
         match c {
             '+' | '-' | '*' | '/' | '^' => out.push(Token::Op(c)),
             '(' => out.push(Token::LParen),
@@ -154,6 +195,16 @@ impl Parser {
             let rhs = self.expression(right_bp)?;
             lhs = Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
+        if min_bp == 0 {
+            if let Some(Token::Compare(op)) = self.peek().cloned() {
+                self.take();
+                let rhs = self.expression(1)?;
+                lhs = Expr::Compare { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                if matches!(self.peek(), Some(Token::Compare(_))) {
+                    return Err("Use parentheses to combine comparisons".into());
+                }
+            }
+        }
         Ok(lhs)
     }
 }
@@ -166,6 +217,11 @@ pub fn evaluate_clear_for_testing(
 ) -> Result<i128, String> {
     match expr {
         Expr::Number(n) => Ok(*n),
+        Expr::Compare { op, lhs, rhs } => {
+            let left = evaluate_clear_for_testing(lhs, vars)?;
+            let right = evaluate_clear_for_testing(rhs, vars)?;
+            Ok(i128::from(op.matches(left.cmp(&right))) * SCALE)
+        }
         Expr::Variable(name) => vars.get(name).copied()
             .ok_or_else(|| format!("Variable '{name}' has no assigned value")),
         Expr::Unary { op, rhs } => {
@@ -244,5 +300,14 @@ mod tests {
     #[test] fn division_by_zero_rejected() {
         let ast = parse("4 / 0").unwrap();
         assert!(evaluate_clear_for_testing(&ast, &HashMap::new()).is_err());
+    }
+    #[test] fn comparison_precedence_and_tokens() {
+        assert_eq!(run("2 + 3 * 4 >= 14"), "1");
+        assert_eq!(run("-2 < -3"), "0");
+        assert_eq!(run("(1 == 1) + (1 != 1)"), "1");
+        assert_eq!(run("1 > 2"), "0");
+        assert_eq!(run("3 <= 3"), "1");
+        assert!(parse("1 < 2 < 3").is_err());
+        assert!(parse("1 = 1").is_err());
     }
 }

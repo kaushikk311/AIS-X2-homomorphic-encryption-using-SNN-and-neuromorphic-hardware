@@ -5,12 +5,27 @@ use std::time::Instant;
 use tfhe::core_crypto::prelude::*;
 use tfhe::shortint::parameters::v1_8::V1_8_PARAM_MESSAGE_2_CARRY_2_KS_PBS_GAUSSIAN_2M128;
 
-use tfhe_demo::expression::{format_fixed, parse, Expr, SCALE};
+use tfhe_demo::expression::{format_fixed, parse, Comparison, Expr, SCALE};
 use tfhe_demo::ADDRESS;
 
 #[path = "backend/radix.rs"]
 mod radix;
-use radix::{EncryptedValue, Radix};
+use radix::{inspect_ciphertexts, Digit, EncryptedValue, Radix};
+
+fn section(title: &str) {
+    println!("\n========== {title} ==========");
+}
+
+fn comparison_symbol(op: Comparison) -> &'static str {
+    match op {
+        Comparison::Less => "<",
+        Comparison::LessEqual => "<=",
+        Comparison::Equal => "==",
+        Comparison::NotEqual => "!=",
+        Comparison::GreaterEqual => ">=",
+        Comparison::Greater => ">",
+    }
+}
 
 fn send(stream: &mut TcpStream, line: &str) -> io::Result<()> {
     println!("{line}");
@@ -26,10 +41,11 @@ fn validate(expr: &Expr) -> Result<(), String> {
         )),
         Expr::Unary { op: '+' | '-', rhs } => validate(rhs),
         Expr::Binary {
-            op: '+' | '-' | '*',
+            op: '+' | '-' | '*' | '/',
             lhs,
             rhs,
-        } => {
+        }
+        | Expr::Compare { lhs, rhs, .. } => {
             validate(lhs)?;
             validate(rhs)
         }
@@ -39,51 +55,116 @@ fn validate(expr: &Expr) -> Result<(), String> {
     }
 }
 
-fn evaluate(
+fn print_ast(expr: &Expr, depth: usize) {
+    let indent = "  ".repeat(depth);
+    match expr {
+        Expr::Number(value) => println!("{indent}Number {}", format_fixed(*value)),
+        Expr::Variable(name) => println!("{indent}Variable {name}"),
+        Expr::Unary { op, rhs } => {
+            println!("{indent}Unary {op}");
+            print_ast(rhs, depth + 1);
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Compare { lhs, rhs, .. } => {
+            match expr {
+                Expr::Binary { op, .. } => println!("{indent}Binary {op}"),
+                Expr::Compare { op, .. } => println!("{indent}Compare {}", comparison_symbol(*op)),
+                _ => unreachable!(),
+            }
+            print_ast(lhs, depth + 1);
+            print_ast(rhs, depth + 1);
+        }
+    }
+}
+
+enum EncryptedExpr {
+    Number(EncryptedValue),
+    Unary(char, Box<EncryptedExpr>),
+    Binary(char, Box<EncryptedExpr>, Box<EncryptedExpr>),
+    Compare(Comparison, Box<EncryptedExpr>, Box<EncryptedExpr>),
+}
+
+fn encrypt_expression(
     expr: &Expr,
     radix: &Radix,
     key: &LweSecretKeyOwned<u64>,
     generator: &mut EncryptionRandomGenerator<DefaultRandomGenerator>,
-) -> EncryptedValue {
+) -> EncryptedExpr {
+    let mut child = |expr: &Expr| Box::new(encrypt_expression(expr, radix, key, generator));
     match expr {
-        Expr::Number(value) => radix.encrypt(*value, key, generator),
-        Expr::Unary { op, rhs } => {
-            let value = evaluate(rhs, radix, key, generator);
-            if *op == '-' {
-                radix.negate(&value)
-            } else {
-                value
-            }
-        }
-        Expr::Binary { op, lhs, rhs } => {
-            let left = evaluate(lhs, radix, key, generator);
-            let right = evaluate(rhs, radix, key, generator);
-            let start = Instant::now();
-            let value = match op {
-                '+' => radix.add(&left, &right, false),
-                '-' => radix.add(&left, &right, true),
-                '*' => radix.multiply(&left, &right),
-                _ => unreachable!("operator validated before evaluation"),
-            };
-            println!("[EVAL/PBS/KS] {op} in {:?}", start.elapsed());
-            value
-        }
-        Expr::Variable(_) => unreachable!("variables rejected before evaluation"),
+        Expr::Number(value) => EncryptedExpr::Number(radix.encrypt(*value, key, generator)),
+        Expr::Unary { op, rhs } => EncryptedExpr::Unary(*op, child(rhs)),
+        Expr::Binary { op, lhs, rhs } => EncryptedExpr::Binary(*op, child(lhs), child(rhs)),
+        Expr::Compare { op, lhs, rhs } => EncryptedExpr::Compare(*op, child(lhs), child(rhs)),
+        Expr::Variable(_) => unreachable!("variables rejected before encryption"),
     }
 }
 
-fn inspect_radix(value: &EncryptedValue) {
-    println!("[RESULT] {} encrypted radix blocks", value.blocks.len());
-    for (index, ciphertext) in value.blocks.iter().enumerate() {
-        let mask = ciphertext.get_mask();
-        let coefficients = mask.as_ref();
-        println!(
-            "[BLOCK {index}] LWE dimension={}, first mask coefficients={:?}, body={}",
-            coefficients.len(),
-            &coefficients[..coefficients.len().min(8)],
-            ciphertext.get_body().data,
-        );
+fn evaluate(expr: EncryptedExpr, radix: &Radix) -> (EncryptedValue, Option<Digit>) {
+    match expr {
+        EncryptedExpr::Number(value) => (value, None),
+        EncryptedExpr::Unary(op, rhs) => {
+            let (value, error) = evaluate(*rhs, radix);
+            let value = if op == '-' {
+                println!("[ARITHMETIC] Unary minus: complement the radix digits and propagate the carry.");
+                radix.trace_pbs("Unary minus", || radix.negate(&value))
+            } else {
+                value
+            };
+            (value, error)
+        }
+        EncryptedExpr::Binary(op, lhs, rhs) => {
+            let (left, lhs_error) = evaluate(*lhs, radix);
+            let (right, rhs_error) = evaluate(*rhs, radix);
+            let description = match op {
+                '+' => "Add LWE digits with lwe_ciphertext_add_assign. Use sum and carry LUTs to propagate the encrypted carry.",
+                '-' => "Run standalone encrypted subtraction.",
+                '*' => "Use PBS product LUTs for pairs of LWE digits, then reduce the partial products and rescale.",
+                '/' => "Run standalone encrypted division.",
+                _ => unreachable!("operator validated before encryption"),
+            };
+            println!("[ARITHMETIC] {op}: {description}");
+            radix.trace_pbs(&format!("Operator {op}"), || {
+                let (value, operation_error) = match op {
+                    '+' => (radix.add(&left, &right), None),
+                    '-' => (radix.subtract(&left, &right), None),
+                    '*' => (radix.multiply(&left, &right), None),
+                    '/' => {
+                        let (value, zero) = radix.divide(&left, &right);
+                        (value, Some(zero))
+                    }
+                    _ => unreachable!("operator validated before encryption"),
+                };
+                let error = merge_errors(
+                    radix,
+                    merge_errors(radix, lhs_error, rhs_error),
+                    operation_error,
+                );
+                (value, error)
+            })
+        }
+        EncryptedExpr::Compare(op, lhs, rhs) => {
+            let (left, lhs_error) = evaluate(*lhs, radix);
+            let (right, rhs_error) = evaluate(*rhs, radix);
+            let symbol = comparison_symbol(op);
+            println!("[ARITHMETIC] Compare {symbol}: evaluate signed digit ordering with PBS LUTs and encode it as encrypted 0 or 1.");
+            radix.trace_pbs(&format!("Comparison {symbol}"), || {
+                let value = radix.compare(&left, &right, op);
+                (value, merge_errors(radix, lhs_error, rhs_error))
+            })
+        }
     }
+}
+
+fn merge_errors(radix: &Radix, left: Option<Digit>, right: Option<Digit>) -> Option<Digit> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(radix.either_error(left, &right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn send_outcome(stream: &mut TcpStream, line: &str) -> io::Result<()> {
+    section("06 Send outcome to frontend");
+    send(stream, line)
 }
 
 fn main() -> io::Result<()> {
@@ -92,6 +173,9 @@ fn main() -> io::Result<()> {
     let (mut stream, peer) = listener.accept()?;
     println!("[BACKEND] Connected: {peer}");
 
+    section("Session setup | Generate TFHE keys");
+    println!("[KEYGEN] Creating runtime random generators and session keys before sending READY.");
+    println!("[KEYGEN] Parameter set: V1_8_PARAM_MESSAGE_2_CARRY_2_KS_PBS_GAUSSIAN_2M128");
     let params = V1_8_PARAM_MESSAGE_2_CARRY_2_KS_PBS_GAUSSIAN_2M128;
     let mut boxed_seeder = new_seeder();
     let seeder = boxed_seeder.as_mut();
@@ -108,6 +192,11 @@ fn main() -> io::Result<()> {
         &mut secret_generator,
     );
     let large_key = glwe_key.clone().into_lwe_secret_key();
+    println!(
+        "[KEYGEN] Small LWE dimension={}, GLWE dimension={}, polynomial size={}, large LWE dimension={}",
+        small_key.lwe_dimension().0, params.glwe_dimension.0, params.polynomial_size.0,
+        large_key.lwe_dimension().0,
+    );
     println!("[KEYGEN] LWE and GLWE keys: {:?}", start.elapsed());
 
     send(
@@ -115,6 +204,7 @@ fn main() -> io::Result<()> {
         "STATUS|Generating standard and Fourier bootstrapping keys",
     )?;
     let start = Instant::now();
+    println!("[CORE CRYPTO] par_allocate_and_generate_new_lwe_bootstrap_key");
     let standard_bsk = par_allocate_and_generate_new_lwe_bootstrap_key(
         &small_key,
         &glwe_key,
@@ -134,6 +224,7 @@ fn main() -> io::Result<()> {
         standard_bsk.decomposition_level_count(),
     );
     convert_standard_lwe_bootstrap_key_to_fourier(&standard_bsk, &mut fourier_bsk);
+    println!("[CORE CRYPTO] convert_standard_lwe_bootstrap_key_to_fourier");
     println!("[KEYGEN] Fourier conversion: {:?}", start.elapsed());
     drop(standard_bsk);
 
@@ -142,6 +233,7 @@ fn main() -> io::Result<()> {
         "STATUS|Generating key-switching key and PBS lookup tables",
     )?;
     let start = Instant::now();
+    println!("[CORE CRYPTO] allocate_and_generate_new_lwe_keyswitch_key");
     let ksk = allocate_and_generate_new_lwe_keyswitch_key(
         &large_key,
         &small_key,
@@ -167,6 +259,8 @@ fn main() -> io::Result<()> {
         params.lwe_noise_distribution, params.glwe_noise_distribution,
         params.modulus_switch_noise_reduction_params,
     );
+    println!("[CORE CRYPTO] generate_programmable_bootstrap_glwe_lut builds the lookup tables.");
+    radix.describe_pbs();
     send(&mut stream, "READY")?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -176,31 +270,72 @@ fn main() -> io::Result<()> {
         if reader.read_line(&mut line)? == 0 || line.trim_end() == "EXIT" {
             return Ok(());
         }
+        section("01 Receive expression from frontend");
         let Some(source) = line.trim_end().strip_prefix("EXPR|") else {
-            send(&mut stream, "ERROR|Invalid expression request")?;
+            send_outcome(&mut stream, "ERROR|Invalid expression request")?;
             continue;
         };
+        println!("[TCP] Input: {source}");
+        section("02 Parse expression and build AST");
         let expr = match parse(source).and_then(|expr| {
             validate(&expr)?;
             Ok(expr)
         }) {
             Ok(expr) => expr,
             Err(error) => {
-                send(&mut stream, &format!("ERROR|{error}"))?;
+                send_outcome(&mut stream, &format!("ERROR|{error}"))?;
                 continue;
             }
         };
+        print_ast(&expr, 0);
 
+        let request_start = Instant::now();
+        let pbs_before = radix.pbs_count();
+        section("03 Encrypt input values and inspect ciphertexts");
+        println!("[KEYGEN] Using the TFHE keys generated at session setup.");
         send(&mut stream, "STATUS|Evaluating encrypted expression")?;
-        let result = evaluate(&expr, &radix, &small_key, &mut encryption_generator);
-        inspect_radix(&result);
+        let encrypted = encrypt_expression(&expr, &radix, &small_key, &mut encryption_generator);
+
+        section("04 Encrypted arithmetic with PBS and key switching");
+        let (result, error) = evaluate(encrypted, &radix);
+        let pbs_calls = radix.pbs_count() - pbs_before;
+        println!("[PBS/KS] Request total: {pbs_calls} bootstraps and {pbs_calls} key switches, including input refresh.");
+        inspect_ciphertexts("Encrypted expression result", &result.blocks);
+
+        section("05 Decrypt final outcome");
         let start = Instant::now();
+        println!("[CORE CRYPTO] decrypt_lwe_ciphertext uses the small LWE secret key to recover the encoded phase.");
+        if let Some(flag) = error {
+            println!("[DECRYPT] Checking the final encrypted division-by-zero flag.");
+            match radix.decrypt_error(&flag, &small_key) {
+                Ok(false) => {}
+                Ok(true) => {
+                    send_outcome(&mut stream, "ERROR|Division by zero")?;
+                    continue;
+                }
+                Err(error) => {
+                    send_outcome(&mut stream, &format!("ERROR|{error}"))?;
+                    continue;
+                }
+            }
+        }
+        println!(
+            "[DECRYPT] Round each decoded phase and reconstruct the signed fixed-point integer."
+        );
         match radix.decrypt(&result, &small_key) {
             Ok(value) => {
-                println!("[DECRYPT] Final radix result: {:?}", start.elapsed());
-                send(&mut stream, &format!("VALUE|{}", format_fixed(value)))?;
+                let formatted = format_fixed(value);
+                println!(
+                    "[DECRYPT] {value} ÷ {SCALE} = {formatted} in {:?}",
+                    start.elapsed()
+                );
+                send_outcome(&mut stream, &format!("VALUE|{formatted}"))?;
+                println!(
+                    "[TIMING] Encryption through response: {:?}",
+                    request_start.elapsed()
+                );
             }
-            Err(error) => send(&mut stream, &format!("ERROR|{error}"))?,
+            Err(error) => send_outcome(&mut stream, &format!("ERROR|{error}"))?,
         }
     }
 }
