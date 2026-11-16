@@ -6,12 +6,12 @@ Repository:
 ## Overview
 
 This repository contains the Rust implementation components for exploring fully homomorphic encryption with **TFHE-RS 1.8.1**. The checked-in source files provide:
-1. A decoupled high-level client-server encrypted arithmetic pipeline (`FheInt128`).
+1. A localhost TCP calculator that evaluates fixed-point expressions using TFHE Core Crypto.
 2. A low-level hardware-oriented LWE modulo $2^{64}$ homomorphic addition benchmark (~200ns execution latency).
 3. A floating-point LWE addition primitive with fixed-point decimal scaling.
 4. Educational LWE diagnostic inspectors verifying Torus noise bounds, ideal nearest-level rounding, and residual drift.
 
-The repository supports our Capstone Project: **"Neuromorphic Acceleration of Secure Encrypted Neural Network Inference"** (Phase-1, Review 2).
+The repository supports our Capstone Project: **"Neuromorphic Acceleration of Secure Encrypted Neural Network Inference"** (Phase 1).
 
 ---
 
@@ -27,10 +27,11 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 ├── README.md
 │
 └── src/
-    ├── main.rs                          # Client frontend entry point
+    ├── main.rs                          # Alias for the expression frontend
     │
     └── bin/
-        ├── backend.rs                   # Decoupled TCP server (FheInt128 pipeline)
+        ├── backend.rs                   # Core Crypto expression backend
+        ├── frontend.rs                  # TCP expression frontend
         ├── lwe_addition.rs              # Low-level LWE integer addition (~200ns)
         ├── lwe_addition_float.rs        # Low-level LWE floating-point addition
         ├── lwe_inspector.rs             # LWE real input with ideal rounding
@@ -40,8 +41,8 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 ### File Descriptions
 
 * **`Cargo.toml`** — Package configuration and TFHE-RS dependency (`tfhe = { version = "=1.8.1", features = ["integer"] }`).
-* **`src/main.rs`** — Client frontend that collects user inputs and sends requests to the backend server.
-* **`src/bin/backend.rs`** — TCP backend server listening on `127.0.0.1:7878`. Generates 128-bit IND-CPA keys, installs evaluation keys, evaluates operations on `FheInt128` ciphertexts, and returns decrypted results.
+* **`src/bin/frontend.rs`** — Reads full expressions and displays results and errors.
+* **`src/bin/backend.rs`** — Receives expressions, generates session keys, evaluates encrypted radix blocks, and returns the final result.
 * **`src/bin/lwe_addition.rs`** — Low-level LWE modulo $2^{64}$ homomorphic addition benchmark. Computes vector additions directly on ciphertexts in 100ns–204ns without decryption.
 * **`src/bin/lwe_addition_float.rs`** — Low-level LWE floating-point addition. Performs homomorphic addition on continuous decimal inputs (5 decimal places) and absorbs cryptographic noise via nearest-level shift.
 * **`src/bin/lwe_inspector.rs`** — Real-valued LWE noise inspector with ideal nearest-level rounding. Maps decimals to Torus $\mathbb{T}^{64}$, verifies LWE residual noise $e = b - \langle a,s \rangle - m$, and recovers the exact input with zero noise corruption.
@@ -53,7 +54,7 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 
 * **Language:** Rust (2021 edition)
 * **Cryptographic Engine:** TFHE-RS 1.8.1
-* **High-Level API:** `FheInt128` signed 128-bit encrypted integer arithmetic with $10^9$ fixed-point decimal scaling
+* **Number format:** Signed 128-bit fixed-point values with five decimal places, encrypted as 64 two-bit LWE blocks
 * **Low-Level API:** `tfhe::core_crypto::prelude::*` for binary LWE secret keys, Gaussian noise sampling, modulo $2^{64}$ vector sums, and Torus decomposition
 * **Transport:** TCP socket communication over `127.0.0.1:7878`
 
@@ -61,17 +62,17 @@ AIS-X2-homomorphic-encryption-using-SNN-and-neuromorphic-hardware/
 
 ## Execution Instructions & Demonstration Guide
 
-### 1. High-Level Client-Server TFHE Execution (127.0.0.1:7878)
+### 1. Encrypted Expression Demo
 In Terminal 1, start the backend server:
 ```bash
-cargo run --bin backend --release
+cargo run --locked --release --bin backend
 ```
 In Terminal 2, start the frontend client:
 ```bash
-cargo run --release
+cargo run --locked --release --bin frontend
 ```
-* **Inputs:** Select operation `1` (Addition), enter `3.14159` and `2.71828`.
-* **Output:** `5.85987` (100% precision match, zero quantization loss).
+* **Input:** Enter `12.50 * 4.25 + 3.10` in the frontend.
+* **Output:** The frontend displays `56.225`. The backend shows key setup, the AST, LWE samples, PBS and key switching, and final decryption.
 
 ---
 
@@ -118,6 +119,6 @@ cargo run --bin lwe_inspector_no_rounding --release
 
 ## Security & Implementation Notes
 
-1. **IND-CPA Security:** In production mode, 128-bit cryptographic security is maintained by adding small Gaussian noise to the least significant bits (LSBs).
-2. **Noise Rounding (`closest_representable`):** Absorbs LWE noise upon decryption to guarantee 100% mathematical ground-truth correctness.
-3. **Decoupled Architecture:** Client keys never leave the client device; the cloud server only holds evaluation keys and cannot decrypt user data.
+1. **Cryptographic setup:** The demo uses a named TFHE-rs parameter set with Gaussian noise and generates keys at runtime.
+2. **Noise management:** The expression backend uses PBS and key switching during evaluation and rounds the encoded phase when decoding the final blocks.
+3. **Local demo:** The frontend sends expression text over loopback. The backend encrypts the inputs, computes on ciphertexts, and decrypts the final result.
