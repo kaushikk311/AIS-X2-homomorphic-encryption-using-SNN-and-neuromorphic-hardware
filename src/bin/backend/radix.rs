@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::cmp::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -8,10 +10,30 @@ use tfhe::shortint::parameters::{
     ClassicPBSParameters, ModulusSwitchNoiseReductionParams, ModulusSwitchType,
 };
 
-use tfhe_demo::expression::{MAX_INPUT, SCALE};
+use tfhe_demo::expression::{format_fixed, Comparison, MAX_INPUT, SCALE};
 
 pub type Digit = LweCiphertextOwned<u64>;
 type Lut = GlweCiphertextOwned<u64>;
+const BLOCKS_TO_SHOW: usize = 4;
+const MASK_COEFFICIENTS_TO_SHOW: usize = 8;
+
+pub fn inspect_ciphertexts(label: &str, blocks: &[Digit]) {
+    let sample_count = blocks.len().min(BLOCKS_TO_SHOW);
+    println!(
+        "[CIPHERTEXT] {label}: showing {sample_count} of {} blocks, least significant first",
+        blocks.len()
+    );
+    for (index, ciphertext) in blocks.iter().take(sample_count).enumerate() {
+        let mask = ciphertext.get_mask();
+        let coefficients = mask.as_ref();
+        let sample = &coefficients[..coefficients.len().min(MASK_COEFFICIENTS_TO_SHOW)];
+        println!(
+            "  [BLOCK {index}] LWE dimension={}, first mask coefficients={sample:?}, body={}",
+            coefficients.len(),
+            ciphertext.get_body().data,
+        );
+    }
+}
 
 thread_local! {
     static PBS_BUFFER: RefCell<ComputationBuffers> = RefCell::new(ComputationBuffers::new());
@@ -37,6 +59,7 @@ pub struct Radix {
     )>,
     fft: Fft,
     scratch_bytes: usize,
+    completed_pbs: AtomicUsize,
     identity: Lut,
     sum: Lut,
     carry: Lut,
@@ -47,6 +70,9 @@ pub struct Radix {
     keep_if_clear: Lut,
     low_bit: Lut,
     high_bit: Lut,
+    digit_order: Lut,
+    merge_order: Lut,
+    bias_sign: Lut,
 }
 
 impl Radix {
@@ -116,6 +142,7 @@ impl Radix {
             drift,
             fft,
             scratch_bytes,
+            completed_pbs: AtomicUsize::new(0),
             identity: lut(&|value| value),
             sum: lut(&|value| value % base),
             carry: lut(&|value| value / base),
@@ -126,6 +153,13 @@ impl Radix {
             keep_if_clear: lut(&|pair| (pair / 2) * (1 - pair % 2)),
             low_bit: lut(&|value| value % 2),
             high_bit: lut(&|value| (value / 2) % 2),
+            digit_order: lut(&|difference| match difference.cmp(&(base - 1)) {
+                Ordering::Less => 0,
+                Ordering::Equal => 1,
+                Ordering::Greater => 2,
+            }),
+            merge_order: lut(&|pair| if pair / 3 == 1 { pair % 3 } else { pair / 3 }),
+            bias_sign: lut(&|digit| (digit + base / 2) % base),
         }
     }
 
@@ -176,7 +210,36 @@ impl Radix {
         extract_lwe_sample_from_glwe_ciphertext(&accumulator, &mut large, MonomialDegree(0));
         let mut small = self.constant(0);
         keyswitch_lwe_ciphertext(&self.ksk, &large, &mut small);
+        self.completed_pbs.fetch_add(1, Relaxed);
         small
+    }
+
+    pub fn pbs_count(&self) -> usize {
+        self.completed_pbs.load(Relaxed)
+    }
+
+    pub fn trace_pbs<T>(&self, purpose: &str, operation: impl FnOnce() -> T) -> T {
+        let before = self.pbs_count();
+        let start = Instant::now();
+        let result = operation();
+        let calls = self.pbs_count() - before;
+        println!(
+            "[PBS/KS] {purpose}: {calls} bootstraps and {calls} key switches in {:?}",
+            start.elapsed()
+        );
+        result
+    }
+
+    pub fn describe_pbs(&self) {
+        let small = self.ksk.output_key_lwe_dimension().0;
+        let large = self.ksk.input_key_lwe_dimension().0;
+        println!(
+            "[PBS] Modulus switching: {:?}",
+            self.params.modulus_switch_noise_reduction_params
+        );
+        println!("[CORE CRYPTO] blind_rotate_assign_mem_optimized applies the LUT with the Fourier bootstrapping key");
+        println!("[CORE CRYPTO] extract_lwe_sample_from_glwe_ciphertext produces a large LWE ciphertext (dimension {large})");
+        println!("[CORE CRYPTO] keyswitch_lwe_ciphertext returns it to the small LWE key (dimension {small})");
     }
 
     fn constant(&self, digit: u64) -> Digit {
@@ -185,6 +248,11 @@ impl Radix {
             Plaintext(digit * self.delta),
             self.params.ciphertext_modulus,
         )
+    }
+
+    fn decode(&self, block: &Digit, key: &LweSecretKeyOwned<u64>) -> u64 {
+        let phase = decrypt_lwe_ciphertext(key, block).0;
+        phase.wrapping_add(self.delta / 2) / self.delta
     }
 
     fn digits_for(&self, value: u128) -> usize {
@@ -199,9 +267,22 @@ impl Radix {
     ) -> EncryptedValue {
         let start = Instant::now();
         let bits = value as u128;
-        let fresh: Vec<_> = (0..self.block_count)
-            .map(|index| {
-                let digit = (bits >> (index * self.bits)) as u64 % self.base;
+        let digits: Vec<_> = (0..self.block_count)
+            .map(|index| (bits >> (index * self.bits)) as u64 % self.base)
+            .collect();
+        println!("[ENCODE] {} × {SCALE} = {value}", format_fixed(value));
+        println!(
+            "[ENCODE] {} base-{} blocks, {} bits per block. Low digits: {:?}",
+            digits.len(),
+            self.base,
+            self.bits,
+            &digits[..digits.len().min(BLOCKS_TO_SHOW)],
+        );
+        println!("[CORE CRYPTO] allocate_and_encrypt_new_lwe_ciphertext encrypts each digit × Δ, where Δ = {}", self.delta);
+        println!("[LWE] Sample a random mask a and Gaussian error e. Store (a, b), where b = <a, s> + digit × Δ + e modulo 2^64.");
+        let fresh: Vec<_> = digits
+            .into_iter()
+            .map(|digit| {
                 allocate_and_encrypt_new_lwe_ciphertext(
                     key,
                     Plaintext(digit * self.delta),
@@ -216,12 +297,15 @@ impl Radix {
             fresh.len(),
             start.elapsed()
         );
-        let start = Instant::now();
-        let blocks = fresh
-            .par_iter()
-            .map(|digit| self.pbs(digit, &self.identity))
-            .collect();
-        println!("[PBS/KS] Refreshed literal in {:?}", start.elapsed());
+        inspect_ciphertexts("Fresh input (before PBS)", &fresh);
+        println!("[PBS] Identity lookup table refreshes the input blocks and preserves their encoded digits.");
+        let blocks: Vec<_> = self.trace_pbs("Input refresh", || {
+            fresh
+                .par_iter()
+                .map(|digit| self.pbs(digit, &self.identity))
+                .collect()
+        });
+        inspect_ciphertexts("Refreshed input (after PBS and key switching)", &blocks);
         EncryptedValue {
             blocks,
             width: self.digits_for((MAX_INPUT as u128) << 1),
@@ -235,8 +319,7 @@ impl Radix {
     ) -> Result<i128, String> {
         let mut result = 0u128;
         for (index, block) in value.blocks.iter().enumerate() {
-            let phase = decrypt_lwe_ciphertext(key, block).0;
-            let digit = phase.wrapping_add(self.delta / 2) / self.delta;
+            let digit = self.decode(block, key);
             if digit >= self.base {
                 return Err(format!("Invalid radix digit in final result block {index}"));
             }
@@ -283,21 +366,14 @@ impl Radix {
         out
     }
 
-    pub fn add(
-        &self,
-        lhs: &EncryptedValue,
-        rhs: &EncryptedValue,
-        subtract: bool,
-    ) -> EncryptedValue {
-        let width = (lhs.width.max(rhs.width) + 1).min(self.block_count);
-        let left = &lhs.blocks[..width];
-        let right = &rhs.blocks[..width];
-        let (blocks, _) = if subtract {
-            let complement: Vec<_> = right.iter().map(|digit| self.complement(digit)).collect();
-            self.add_blocks(left, &complement, self.constant(1))
-        } else {
-            self.add_blocks(left, right, self.constant(0))
-        };
+    fn addition_width(&self, lhs: &EncryptedValue, rhs: &EncryptedValue) -> usize {
+        (lhs.width.max(rhs.width) + 1).min(self.block_count)
+    }
+
+    pub fn add(&self, lhs: &EncryptedValue, rhs: &EncryptedValue) -> EncryptedValue {
+        let width = self.addition_width(lhs, rhs);
+        let (blocks, _) =
+            self.add_blocks(&lhs.blocks[..width], &rhs.blocks[..width], self.constant(0));
         self.signed_value(blocks)
     }
 
@@ -345,6 +421,86 @@ impl Radix {
         let digits = &value.blocks[..value.width];
         let sign = self.pbs(digits.last().expect("nonempty signed value"), &self.sign);
         (self.conditional_negate(digits, &sign), sign)
+    }
+
+    pub fn compare(
+        &self,
+        lhs: &EncryptedValue,
+        rhs: &EncryptedValue,
+        op: Comparison,
+    ) -> EncryptedValue {
+        let width = lhs.width.max(rhs.width);
+        // Reversing the sign bit on the most significant digit makes unsigned order signed.
+        let mut orders: Vec<_> = (0..width)
+            .into_par_iter()
+            .map(|index| {
+                let (mut left, right) = if index + 1 == width {
+                    (
+                        self.pbs(&lhs.blocks[index], &self.bias_sign),
+                        self.pbs(&rhs.blocks[index], &self.bias_sign),
+                    )
+                } else {
+                    (lhs.blocks[index].clone(), rhs.blocks[index].clone())
+                };
+                lwe_ciphertext_sub_assign(&mut left, &right);
+                lwe_ciphertext_plaintext_add_assign(
+                    &mut left,
+                    Plaintext((self.base - 1) * self.delta),
+                );
+                self.pbs(&left, &self.digit_order)
+            })
+            .collect();
+        // The most significant unequal digit determines the ordering.
+        while orders.len() > 1 {
+            orders = orders
+                .par_chunks(2)
+                .map(|pair| {
+                    let [lower, upper] = pair else {
+                        return pair[0].clone();
+                    };
+                    let mut packed = upper.clone();
+                    lwe_ciphertext_cleartext_mul_assign(&mut packed, Cleartext(3));
+                    lwe_ciphertext_add_assign(&mut packed, lower);
+                    self.pbs(&packed, &self.merge_order)
+                })
+                .collect();
+        }
+        // Encode the encrypted boolean as a fixed-point 0 or 1.
+        let width = self.digits_for((SCALE as u128) << 1);
+        let blocks = (0..width)
+            .into_par_iter()
+            .map(|index| {
+                let digit = ((SCALE as u128) >> (index * self.bits)) as u64 % self.base;
+                if digit == 0 {
+                    return self.constant(0);
+                }
+                let lut = generate_programmable_bootstrap_glwe_lut(
+                    self.params.polynomial_size,
+                    self.params.glwe_dimension.to_glwe_size(),
+                    (self.base * self.params.carry_modulus.0) as usize,
+                    self.params.ciphertext_modulus,
+                    self.delta,
+                    |code| digit * u64::from(op.matches(code.cmp(&1))),
+                );
+                self.pbs(&orders[0], &lut)
+            })
+            .collect();
+        self.signed_value(blocks)
+    }
+
+    fn signed_quotient(
+        &self,
+        mut digits: Vec<Digit>,
+        mut left_sign: Digit,
+        right_sign: &Digit,
+    ) -> EncryptedValue {
+        lwe_ciphertext_add_assign(&mut left_sign, right_sign);
+        let sign = self.pbs(&left_sign, &self.low_bit);
+        if digits.len() < self.block_count {
+            digits.push(self.constant(0));
+        }
+        digits.truncate(self.block_count);
+        self.signed_value(self.conditional_negate(&digits, &sign))
     }
 
     fn digit_product(&self, left: &Digit, right: &Digit) -> (Digit, Digit) {
@@ -505,29 +661,15 @@ impl Radix {
     }
 
     pub fn multiply(&self, lhs: &EncryptedValue, rhs: &EncryptedValue) -> EncryptedValue {
+        println!("[MULTIPLICATION] Prepare encrypted magnitudes and signs.");
         let ((left, left_sign), (right, right_sign)) =
             rayon::join(|| self.magnitude(lhs), || self.magnitude(rhs));
-        let start = Instant::now();
-        let product = self.multiply_magnitudes(&left, &right);
-        println!(
-            "[MUL/PBS/KS] Partial products and carry reduction: {:?}",
-            start.elapsed()
-        );
-        let start = Instant::now();
-        let mut scaled = self.rescale(&product);
-        println!(
-            "[RESCALE/PBS/KS] Encrypted division by {SCALE}: {:?}",
-            start.elapsed()
-        );
-
-        let mut sign_sum = left_sign;
-        lwe_ciphertext_add_assign(&mut sign_sum, &right_sign);
-        let sign = self.pbs(&sign_sum, &self.low_bit);
-        // Reserve a sign digit when the quotient fits. At full width, arithmetic wraps as i128.
-        if scaled.len() < self.block_count {
-            scaled.push(self.constant(0));
-        }
-        scaled.truncate(self.block_count);
-        self.signed_value(self.conditional_negate(&scaled, &sign))
+        println!("[MULTIPLICATION] Build partial products and reduce encrypted carry rows.");
+        let product = self.trace_pbs("Partial products and carry reduction", || {
+            self.multiply_magnitudes(&left, &right)
+        });
+        println!("[RESCALE] Restore the encrypted product to fixed-point scale {SCALE}.");
+        let scaled = self.trace_pbs("Product rescaling", || self.rescale(&product));
+        self.signed_quotient(scaled, left_sign, &right_sign)
     }
 }

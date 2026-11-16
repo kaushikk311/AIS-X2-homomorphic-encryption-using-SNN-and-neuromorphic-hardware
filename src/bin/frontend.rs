@@ -52,7 +52,7 @@ fn main() {
     loop {
         println!();
         println!("Enter a complete expression (or type exit):");
-        println!("Example: 1.25 + (-2.5 * 3)");
+        println!("Example: 12.50 * 4.25 + 3.10");
         print!("expression> ");
         io::stdout().flush().expect("flush prompt");
         let mut expr = String::new();
